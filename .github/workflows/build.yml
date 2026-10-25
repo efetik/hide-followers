@@ -58,8 +58,17 @@ jobs:
                   applicationId 'com.anna.hidefollowers'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
+              }
+
+              signingConfigs {
+                  debug {
+                      storeFile file('hf.keystore')
+                      storePassword 'hidefollowers'
+                      keyAlias 'hf'
+                      keyPassword 'hidefollowers'
+                  }
               }
 
               compileOptions {
@@ -108,11 +117,11 @@ jobs:
           cat > 'app/src/main/res/xml/accessibility_config.xml' <<'EOF_HF'
           <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled|typeWindowsChanged"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled|typeWindowsChanged|typeViewClicked|typeViewSelected"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
               android:canRetrieveWindowContent="true"
-              android:notificationTimeout="50"
+              android:notificationTimeout="0"
               android:description="@string/service_description" />
           EOF_HF
           mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
@@ -149,6 +158,7 @@ jobs:
           package com.anna.hidefollowers;
 
           import android.accessibilityservice.AccessibilityService;
+          import android.content.SharedPreferences;
           import android.content.res.Configuration;
           import android.graphics.PixelFormat;
           import android.graphics.Rect;
@@ -156,6 +166,7 @@ jobs:
           import android.os.Build;
           import android.os.Handler;
           import android.os.Looper;
+          import android.os.SystemClock;
           import android.util.TypedValue;
           import android.view.Gravity;
           import android.view.View;
@@ -200,7 +211,19 @@ jobs:
                       IG + ":id/profile_header_edit_profile_button",
                       IG + ":id/edit_profile_button"));
 
+              // Иконка «Профиль» в нижнем меню Instagram.
+              private static final Pattern PROFILE_TAB = Pattern.compile(
+                      "^(профиль|profile|perfil)$",
+                      Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
+
               private final Handler handler = new Handler(Looper.getMainLooper());
+              private SharedPreferences prefs;
+              // Где плашка стояла в прошлый раз — чтобы ставить её заранее, до отрисовки экрана.
+              private List<Rect> lastKnown = new ArrayList<>();
+              // Был ли открыт свой профиль при последней проверке.
+              private boolean wasOnOwnProfile = false;
+              // До этого момента не убираем плашку, поставленную заранее, даже если цифру ещё не нашли.
+              private long predictUntil = 0;
               private final List<View> overlays = new ArrayList<>();
               private List<Rect> current = new ArrayList<>();
               private WindowManager wm;
@@ -212,15 +235,50 @@ jobs:
               protected void onServiceConnected() {
                   super.onServiceConnected();
                   wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  prefs = getSharedPreferences("hide", MODE_PRIVATE);
+                  lastKnown = decode(prefs.getString("rects", ""));
               }
 
               @Override
               public void onAccessibilityEvent(AccessibilityEvent event) {
-                  // Без задержки при прокрутке, но не чаще ~20 раз в секунду.
+                  CharSequence pkg = event.getPackageName();
+                  boolean inIg = pkg != null && IG.contentEquals(pkg);
+                  int type = event.getEventType();
+
+                  // Опережаем Instagram: нажала на «Профиль» или вернулась в Instagram, где был открыт профиль —
+                  // сразу ставим плашку на прошлое место, не дожидаясь, пока экран отрисуется.
+                  if (inIg && !lastKnown.isEmpty()) {
+                      boolean tapProfile = (type == AccessibilityEvent.TYPE_VIEW_CLICKED
+                              || type == AccessibilityEvent.TYPE_VIEW_SELECTED) && isProfileTab(event);
+                      boolean backToProfile = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                              && wasOnOwnProfile;
+                      if (tapProfile || backToProfile) {
+                          predictUntil = SystemClock.uptimeMillis() + 1500;
+                          show(lastKnown);
+                      }
+                  }
+
+                  // Проверяем сразу, без искусственной паузы; несколько событий подряд склеиваются в одну проверку.
                   if (!scanPending) {
                       scanPending = true;
-                      handler.postDelayed(scan, 40);
+                      handler.post(scan);
                   }
+              }
+
+              private boolean isProfileTab(AccessibilityEvent event) {
+                  CharSequence d = event.getContentDescription();
+                  if (d != null && PROFILE_TAB.matcher(d.toString().trim()).find()) return true;
+                  for (CharSequence t : event.getText()) {
+                      if (t != null && PROFILE_TAB.matcher(t.toString().trim()).find()) return true;
+                  }
+                  AccessibilityNodeInfo src = event.getSource();
+                  if (src != null) {
+                      String id = src.getViewIdResourceName();
+                      if (id != null && id.endsWith(":id/profile_tab")) return true;
+                      CharSequence sd = src.getContentDescription();
+                      if (sd != null && PROFILE_TAB.matcher(sd.toString().trim()).find()) return true;
+                  }
+                  return false;
               }
 
               private void scanNow() {
@@ -228,6 +286,8 @@ jobs:
                   AccessibilityNodeInfo root = getRootInActiveWindow();
                   if (root == null || root.getPackageName() == null
                           || !IG.contentEquals(root.getPackageName())) {
+                      // Ушла из Instagram — запоминаем, что профиль был открыт, но плашку убираем.
+                      predictUntil = 0;
                       show(new ArrayList<>());
                       return;
                   }
@@ -237,7 +297,27 @@ jobs:
                   int[] budget = {3000};
                   walk(root, found, own, budget);
 
-                  show(own[0] ? merge(found) : new ArrayList<>());
+                  List<Rect> rects = merge(found);
+                  boolean onOwn = own[0] && !rects.isEmpty();
+
+                  if (onOwn) {
+                      wasOnOwnProfile = true;
+                      predictUntil = 0;
+                      if (!rects.equals(lastKnown)) {
+                          lastKnown = rects;
+                          prefs.edit().putString("rects", encode(rects)).apply();
+                      }
+                      show(rects);
+                  } else if (SystemClock.uptimeMillis() < predictUntil) {
+                      // Плашка поставлена заранее, а экран ещё грузится — держим её и проверяем снова.
+                      handler.removeCallbacks(scan);
+                      handler.postDelayed(scan, 60);
+                      scanPending = true;
+                      return;
+                  } else {
+                      if (own[0] || !rects.isEmpty() || root.getChildCount() > 0) wasOnOwnProfile = false;
+                      show(new ArrayList<>());
+                  }
 
                   // Пока плашка на экране — перепроверяем, чтобы она исчезла, когда уходишь из профиля.
                   if (!overlays.isEmpty()) {
@@ -305,7 +385,7 @@ jobs:
 
               private void show(List<Rect> rects) {
                   if (wm == null || rects.equals(current)) return;
-                  current = rects;
+                  current = new ArrayList<>(rects);
 
                   while (overlays.size() > rects.size()) {
                       View v = overlays.remove(overlays.size() - 1);
@@ -335,14 +415,16 @@ jobs:
 
                   TextView v = new TextView(this);
                   v.setBackground(bg);
-                  v.setText("🙈");
+                  v.setText("***");
+                  v.setTextColor(night ? 0xFFF5F5F5 : 0xFF0C1014);
                   v.setGravity(Gravity.CENTER);
-                  v.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+                  v.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+                  v.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                   return v;
               }
 
               private WindowManager.LayoutParams params(Rect r) {
-                  int pad = dp(3);
+                  int pad = dp(6);
                   WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                           r.width() + pad * 2,
                           r.height() + pad * 2,
@@ -360,6 +442,22 @@ jobs:
                               WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
                   }
                   return lp;
+              }
+
+              private static String encode(List<Rect> rects) {
+                  StringBuilder sb = new StringBuilder();
+                  for (Rect r : rects) sb.append(r.flattenToString()).append(';');
+                  return sb.toString();
+              }
+
+              private static List<Rect> decode(String s) {
+                  List<Rect> out = new ArrayList<>();
+                  if (s == null) return out;
+                  for (String part : s.split(";")) {
+                      Rect r = Rect.unflattenFromString(part);
+                      if (r != null && !r.isEmpty()) out.add(r);
+                  }
+                  return out;
               }
 
               private int dp(int v) {
@@ -464,6 +562,7 @@ jobs:
               }
           }
           EOF_HF
+          echo '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' | base64 -d > app/hf.keystore
 
       - uses: actions/setup-java@v4
         with:
